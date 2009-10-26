@@ -10,7 +10,7 @@
    PLATFORM_="Linux"
       SHELL_="bash"
     VERSION_="2.0"
-     AUTHOR_="Federico Cargnelutti"
+     AUTHOR_="Federico Cargnelutti <fedecarg@gmail.com>"
 
 ################################################################################
 
@@ -19,6 +19,9 @@ SCRIPT_DIR=$(dirname $0)
 
 # Working directory
 WORKING_DIR="$(pwd)/deploy"
+
+# Unique ID
+RSYNC_ID=$(date '+%d%m%y-%H%M%S')
 
 # Function =====================================================================
 # Name:        usage
@@ -35,15 +38,20 @@ VERSION:
 DESCRIPTION:
     $PURPOSE_
 USAGE: 
-    ${NAME_} [-c] -e <environment>
+    ${NAME_} -e <environment> create-dir
+    ${NAME_} -e <environment> create-ssh-key
+    ${NAME_} [-q] -e <environment>
 REQUIRES: 
     $REQUIRES_
 OPTIONS:
     -e  Environment: dev, stg or prd
-    -c  Cron job (suppress confirmation messages) - optional
+    -q  Suppress confirmation messages - optional
     -h  Usage information
+KEYWORDS
+    create-dir       Generate skeleton directory
+    create-ssh-key   Generate SSH key
 "
-    exit 1
+    exit 0
 }
 
 # Function =====================================================================
@@ -53,22 +61,29 @@ OPTIONS:
 #===============================================================================
 function trigger_error()
 {
-	if [ $# -eq 1 ] || [ "$2" == "error" ]; then
-		echo "error: $1"
-		exit 1
-	else
-		echo "trigger_error(): invalid arguments"
-		exit 1
-	fi
+    if [ $# -eq 1 ] || [ "$2" == "error" ]; then
+        echo "error: $1"
+        exit 1
+    else
+        echo "trigger_error(): invalid arguments"
+        exit 1
+    fi
 }
 
 # Function =====================================================================
-# Name:        install_ssh_key
+# Name:        create_ssh_key
 # Description: Generate authentication key for ssh
-# Parameter:   $1 <sync.hosts file>
+# Parameter:   $1 <HOST_FILE>
 #===============================================================================
-function install_ssh_key()
+function create_ssh_key()
 {
+    echo -n "[${NAME_}] Generate authentication key for ssh [n/Y]? " 
+    read confirm_action
+    if [ "$confirm_action" != "Y" ]; then 
+         echo "exit: no keys where generated"
+         exit 1
+    fi
+        
     HOST_FILE="${1}"
     if [ ! -f $HOST_FILE ]; then
         trigger_error "no such file: ${HOST_FILE}"
@@ -102,16 +117,59 @@ function install_ssh_key()
             echo "[${NAME_}] Added key to $REMOTE_HOST"
         fi
     done < $HOST_FILE
+    
+    exit 0
 }
 
+# Function =====================================================================
+# Name:        create_dir
+# Description: Create directory structure
+# Parameter:   $1 <environment>
+#===============================================================================
+function create_dir()
+{
+    if [ -d "${WORKING_DIR}/env/${1}" ]; then
+        trigger_error "directory already exists: ${1}"
+    fi
+    
+    echo -n "[${NAME_}] Source directory: " 
+    read SOURCE_DIR
+    echo -n "[${NAME_}] Target directory: " 
+    read TARGET_DIR
+    echo -n "[${NAME_}] User name and hostname (username@hostname): "
+    read HOST
+    echo -n "[${NAME_}] Create sync.exclude file [Y/n]? "
+    read create_exclude_file
+    
+    echo "[${NAME_}] Creating directory structure: ${WORKING_DIR}"
+    mkdir -p ${WORKING_DIR}/{env/${1},log}
+    env_path="${WORKING_DIR}/env/${1}"
+    
+    echo "[${NAME_}] Creating files ..."
+    
+    if [ "${create_exclude_file}" == "Y" ]; then
+        touch ${env_path}/sync.exclude
+        echo -e ".DS_Store\n.svn\n*~\n_*" >> ${env_path}/sync.exclude
+    fi
+    if [ "${HOST}" != "" ]; then
+        touch ${env_path}/sync.host
+        echo $HOST >> ${env_path}/sync.host
+    fi    
+    
+    touch ${env_path}/sync.dir    
+    echo -e "SOURCE_DIR=\"${SOURCE_DIR}\"\nTARGET_DIR=\"${TARGET_DIR}\"" >> ${env_path}/sync.dir
+    
+    echo "[${NAME_}] Done"
+    exit 0
+}    
+    
 #
 # Get options
 #
-while getopts e:khc OPTION; do
+while getopts e:qh OPTION; do
     case "$OPTION" in
        e) environment="$OPTARG";;
-       c) is_cron=1;;
-       k) auth_key=1;;
+       q) quiet=1;;
        h) usage;;
        \?) usage;;
     esac
@@ -121,77 +179,16 @@ shift $(( $OPTIND - 1 ))
 #
 # Check options
 #
-if [ ! -d $WORKING_DIR ]; then
-    trigger_error "invalid root directory: $(pwd)"
-elif [ ! "${environment}" ]; then
+if [ ! "${environment}" ]; then
     usage
+elif [ "${1}" == "create-dir" ]; then
+    create_dir $environment
+elif [ ! -d $WORKING_DIR ]; then
+    trigger_error "directory missing: $(pwd)/deploy"
 fi
 
 #
-# Define env directory
-#
-if [ -d "${WORKING_DIR}/env/${environment}" ]; then
-    ENV_DIR="${WORKING_DIR}/env/${environment}"
-elif [ -d "${SCRIPT_DIR}/env/${environment}" ]; then
-    ENV_DIR="${SCRIPT_DIR}/env/${environment}"
-else 
-    trigger_error "no such environment: ${environment}"
-fi
-
-#
-# Define sync.hosts file
-#
-if [ -f "${WORKING_DIR}/env/${environment}/sync.hosts" ]; then
-    HOST_FILE="${WORKING_DIR}/env/${environment}/sync.hosts"
-    echo "[${NAME_}] Use ${HOST_FILE} ..."
-elif [ -f "${SCRIPT_DIR}/env/${environment}/sync.hosts" ]; then
-    HOST_FILE="${SCRIPT_DIR}/env/${environment}"
-else 
-    trigger_error "no such file: ${ENV_DIR}/sync.hosts"
-fi
-
-#
-# Define sync.exlude file
-#
-if [ -f "${WORKING_DIR}/env/${environment}/sync.exclude" ]; then
-    EXCLUDE_FILE="${WORKING_DIR}/env/${environment}/sync.exclude"
-    echo "[${NAME_}] Use ${EXCLUDE_FILE} ..."
-elif [ -f "${SCRIPT_DIR}/env/${environment}/sync.exclude" ]; then
-    EXCLUDE_FILE="${SCRIPT_DIR}/env/${environment}/sync.exclude"
-fi
-
-#
-# Define sync.path file
-#
-if [ -f "${WORKING_DIR}/env/${environment}/sync.path" ]; then
-    PATH_FILE="${WORKING_DIR}/env/${environment}/sync.path"
-    echo "[${NAME_}] Use ${PATH_FILE} ..."
-elif [ -f "${SCRIPT_DIR}/env/${environment}/sync.path" ]; then
-    PATH_FILE="${SCRIPT_DIR}/env/${environment}"
-else 
-    trigger_error "no such file: ${ENV_DIR}/sync.path"
-fi
-
-source $PATH_FILE
-if [ ! -d "$SOURCE_DIR" ] && [ ! -f "$SOURCE_DIR" ]; then
-    trigger_error "invalid source directory: ${SOURCE_DIR}"
-elif [ ! "$TARGET_DIR" ]; then
-    trigger_error "invalid target directory: ${TARGET_DIR}"
-fi
-
-#
-# Check ssh key
-#
-if [ "${auth_key}" ]; then
-    echo -n "[${NAME_}] Generate authentication key for ssh [n/Y]? " 
-    read confirm_action
-    if [ "$confirm_action" == "Y" ]; then 
-        install_ssh_key $HOST_FILE
-    fi
-fi
-
-#
-# Define log directory
+# Define LOG_DIR (log directory)
 #
 LOG_DIR="${SCRIPT_DIR}/log"
 if [ -d "${WORKING_DIR}/log" ]; then
@@ -199,20 +196,71 @@ if [ -d "${WORKING_DIR}/log" ]; then
 fi
 
 #
-# Define rsync options
+# Define HOST_FILE (sync.host file)
+#
+if [ -f "${WORKING_DIR}/env/${environment}/sync.host" ]; then
+    HOST_FILE="${WORKING_DIR}/env/${environment}/sync.host"
+    echo "[${NAME_}] Using ${HOST_FILE}"
+elif [ -f "${SCRIPT_DIR}/env/${environment}/sync.host" ]; then
+    HOST_FILE="${SCRIPT_DIR}/env/${environment}/sync.host"
+else 
+    trigger_error "no such file: ${WORKING_DIR}/env/${environment}/sync.host"
+fi
+if [ "${1}" == "create-ssh-key" ]; then
+    create_ssh_key $HOST_FILE
+fi
+
+#
+# Define EXCLUDE_FILE (sync.exlude file)
+#
+if [ -f "${WORKING_DIR}/env/${environment}/sync.exclude" ]; then
+    EXCLUDE_FILE="${WORKING_DIR}/env/${environment}/sync.exclude"
+    echo "[${NAME_}] Using ${EXCLUDE_FILE}"
+elif [ -f "${SCRIPT_DIR}/env/${environment}/sync.exclude" ]; then
+    EXCLUDE_FILE="${SCRIPT_DIR}/env/${environment}/sync.exclude"
+fi
+
+#
+# Define DIR_FILE (sync.dir file)
+#
+if [ -f "${WORKING_DIR}/env/${environment}/sync.dir" ]; then
+    DIR_FILE="${WORKING_DIR}/env/${environment}/sync.dir"
+    echo "[${NAME_}] Using ${DIR_FILE}"
+else 
+    trigger_error "no such file: ${ENV_DIR}/sync.dir"
+fi
+
+#
+# Define prehook and posthook commands
+#
+prehook_file="${WORKING_DIR}/env/${environment}/sync.prehook"
+if [ -f $prehook_file ]; then
+    prehook_cmds=$(sed -e :a -e '$!N;s/\n/; /;ta' $prehook_file | sed -e 's/"/'\''/g')
+fi
+posthook_file="${WORKING_DIR}/env/${environment}/sync.posthook"
+if [ -f $posthook_file ]; then
+    posthook_cmds=$(sed -e :a -e '$!N;s/\n/; /;ta' $posthook_file | sed -e 's/"/'\''/g')
+fi
+
+source $DIR_FILE
+if [ ! -d "$SOURCE_DIR" ] && [ ! -f "$SOURCE_DIR" ]; then
+    trigger_error "invalid source directory"
+elif [ ! "$TARGET_DIR" ]; then
+    trigger_error "invalid target directory"
+fi
+
+#
+# rsync options
 #
 rsync_opt="-razv --delete --force"
 if [ "${EXCLUDE_FILE}" ]; then
     rsync_opt="${rsync_opt} --exclude-from=${EXCLUDE_FILE}"
 fi
 
-rsync_id=$(date '+%d%m%y-%H%M%S')
-timestamp=$(date '+%d-%m-%Y %H:%M:%S')
-
 #
 # Display confirmation message
 #
-if [ ! "${is_cron}" ]; then
+if [ ! "${quiet}" ]; then
     echo "[${NAME_}]"
     echo "[${NAME_}] Directory"
     echo "[${NAME_}]     - Source: ${SOURCE_DIR}"
@@ -232,28 +280,28 @@ if [ ! "${is_cron}" ]; then
 fi
 
 #
-# Define pre-hook commands
-#
-prehook_file="${WORKING_DIR}/env/${environment}/sync.prehook"
-if [ -f $prehook_file ]; then
-    prehook_cmds=$(sed -e :a -e '$!N;s/\n/; /;ta' $prehook_file | sed -e 's/"/'\''/g')
-fi
-
-#
 # Transfer files
 #
 while read HOST; do
     echo "[${NAME_}] Copying files to ${HOST}... "
-    filename="${environment}.${rsync_id}.${HOST#*@}"
+    filename="${environment}.${RSYNC_ID}.${HOST#*@}"
     if [ "${prehook_cmds}" ]; then
         ssh $HOST "${prehook_cmds}"
         if [ $? -gt 0 ]; then
-            trigger_error "ssh failed to execute: ${prehook_cmds}"
+            trigger_error "ssh failed to execute prehook commands"
         fi
     fi
+    
     rsync $rsync_opt $SOURCE_DIR $HOST:$TARGET_DIR | tee ${LOG_DIR}/${filename}.log
+    
     if [ $? -gt 0 ]; then
         trigger_error "rsync failed to copy files to ${HOST}"
+    fi
+    if [ "${posthook_cmds}" ]; then
+        ssh $HOST "${posthook_cmds}"
+        if [ $? -gt 0 ]; then
+            trigger_error "ssh failed to execute posthook commands"
+        fi
     fi
 done < $HOST_FILE
 
