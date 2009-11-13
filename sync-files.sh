@@ -20,8 +20,15 @@ SCRIPT_DIR=$(dirname $0)
 # Working directory
 WORKING_DIR="$(pwd)/deploy"
 
-# Unique ID
-RSYNC_ID=$(date '+%d%m%y-%H%M%S')
+# Build directory
+BUILD_DIR="$(pwd)/build"
+
+# Build unique ID
+BUILD_NUMBER=$(date '+%d%m%y-%H%M%S')
+
+# Build date
+BUILD_DATE=$(date '+%Y%m%d')
+
 
 # Function =====================================================================
 # Name:        usage
@@ -40,7 +47,8 @@ DESCRIPTION:
 USAGE: 
     ${NAME_} -e <environment> create-dir
     ${NAME_} -e <environment> create-ssh-key
-    ${NAME_} [-q] -e <environment>
+    ${NAME_} -e <environment> package
+    ${NAME_} [-q] -e <environment> deploy
 REQUIRES: 
     $REQUIRES_
 OPTIONS:
@@ -48,8 +56,10 @@ OPTIONS:
     -q  Suppress confirmation messages - optional
     -h  Usage information
 KEYWORDS
-    create-dir       Generate skeleton directory
-    create-ssh-key   Generate SSH key
+    create-dir       Create project directory
+    create-ssh-key   Create SSH key on remote host(s)
+    package          Create RPM file
+    deploy           Transfer file(s) and execute pre and post commands
 "
     exit 0
 }
@@ -73,7 +83,7 @@ function trigger_error()
 # Function =====================================================================
 # Name:        create_ssh_key
 # Description: Generate authentication key for ssh
-# Parameter:   $1 <HOST_FILE>
+# Parameter:   none
 #===============================================================================
 function create_ssh_key()
 {
@@ -83,9 +93,8 @@ function create_ssh_key()
          echo "exit: no keys where generated"
          exit 1
     fi
-        
-    HOST_FILE="${1}"
-    if [ ! -f $HOST_FILE ]; then
+    
+    if [ ! -f "${HOST_FILE}" ]; then
         trigger_error "no such file: ${HOST_FILE}"
     fi
     
@@ -124,12 +133,14 @@ function create_ssh_key()
 # Function =====================================================================
 # Name:        create_dir
 # Description: Create directory structure
-# Parameter:   $1 <environment>
+# Parameter:   $1 <ENVIRONMENT>
 #===============================================================================
 function create_dir()
 {
-    if [ -d "${WORKING_DIR}/env/${1}" ]; then
-        trigger_error "directory already exists: ${1}"
+    if [ "${ENVIRONMENT}" == "" ]; then
+        trigger_error "environment parameter missing"
+    elif [ -d "${WORKING_DIR}/env/${1}" ]; then
+        trigger_error "directory already exists: ${1}" 
     fi
     
     echo -n "[${NAME_}] Source directory: " 
@@ -162,13 +173,122 @@ function create_dir()
     echo "[${NAME_}] Done"
     exit 0
 }    
+
+# Function =====================================================================
+# Name:        package
+# Description: Package files
+# Parameter:   none
+#===============================================================================
+function package()
+{
+    if [ -f "${ENV_DIR}/package" ]; then
+        trigger_error "package file missing: ${ENV_DIR}/package"
+    fi
+    source ${ENV_DIR}/package
+    exit 0
+}
+
+# Function =====================================================================
+# Name:        deploy
+# Description: Transfer files using rsync and execute pre and post commands 
+# Parameter:   none
+#===============================================================================
+function deploy()
+{
+    # Define EXCLUDE_FILE (sync.exlude file)
+    if [ -f "${ENV_DIR}/sync.exclude" ]; then
+        EXCLUDE_FILE="${ENV_DIR}/sync.exclude"
+        echo "[${NAME_}] Using ${EXCLUDE_FILE}"
+    elif [ -f "${SCRIPT_DIR}/env/${ENVIRONMENT}/sync.exclude" ]; then
+        EXCLUDE_FILE="${SCRIPT_DIR}/env/${ENVIRONMENT}/sync.exclude"
+    fi
     
+    # Define DIR_FILE (sync.dir file)
+    if [ -f "${ENV_DIR}/sync.dir" ]; then
+        DIR_FILE="${ENV_DIR}/sync.dir"
+        echo "[${NAME_}] Using ${DIR_FILE}"
+    else 
+        trigger_error "no such file: ${ENV_DIR}/sync.dir"
+    fi
+    
+    # Define prehook and posthook commands
+    prehook_file="${ENV_DIR}/sync.prehook"
+    if [ -f $prehook_file ]; then
+        prehook_cmds=$(sed -e :a -e '$!N;s/\n/; /;ta' $prehook_file | sed -e 's/"/'\''/g')
+    fi
+    posthook_file="${ENV_DIR}/sync.posthook"
+    if [ -f $posthook_file ]; then
+        posthook_cmds=$(sed -e :a -e '$!N;s/\n/; /;ta' $posthook_file | sed -e 's/"/'\''/g')
+    fi
+    
+    source $DIR_FILE
+    if [ ! -d "$SOURCE_DIR" ] && [ ! -f "$SOURCE_DIR" ]; then
+        trigger_error "invalid source directory"
+    elif [ ! "$TARGET_DIR" ]; then
+        trigger_error "invalid target directory"
+    fi
+    
+    # rsync options
+    rsync_opt="-razv --delete --force"
+    if [ "${EXCLUDE_FILE}" ]; then
+        rsync_opt="${rsync_opt} --exclude-from=${EXCLUDE_FILE}"
+    fi
+    
+    # Display confirmation message
+    if [ ! "${quiet}" ]; then
+        echo "[${NAME_}]"
+        echo "[${NAME_}] Directory"
+        echo "[${NAME_}]     - Source: ${SOURCE_DIR}"
+        echo "[${NAME_}]     - Target: ${TARGET_DIR}"
+        echo "[${NAME_}] Exclude"
+        while read PATTERN; do
+            echo "[${NAME_}]     - ${PATTERN}"
+        done < $EXCLUDE_FILE
+        echo "[${NAME_}] Hosts"
+        while read HOST; do
+            echo "[${NAME_}]     - ${HOST}"
+        done < $HOST_FILE
+        echo "[${NAME_}]"
+        echo -n "[${NAME_}] Transfer files to remote host(s) [n/Y]? " 
+        read confirm_action
+        [[ "$confirm_action" != "Y" ]] && { echo "exit: no files were transferred"; exit 1; }
+    fi
+    
+    # Transfer files
+    while read HOST; do
+        echo "[${NAME_}] Copying files to ${HOST}... "
+        filename="${ENVIRONMENT}.${BUILD_NUMBER}.${HOST#*@}"
+        if [ "${prehook_cmds}" ]; then
+            ssh $HOST "${prehook_cmds}"
+            if [ $? -gt 0 ]; then
+                trigger_error "ssh failed to execute prehook commands"
+            fi
+        fi
+        
+        rsync $rsync_opt $SOURCE_DIR $HOST:$TARGET_DIR | tee ${LOG_DIR}/${filename}.log
+        
+        if [ $? -gt 0 ]; then
+            trigger_error "rsync failed to copy files to ${HOST}"
+        fi
+        if [ "${posthook_cmds}" ]; then
+            ssh $HOST "${posthook_cmds}"
+            if [ $? -gt 0 ]; then
+                trigger_error "ssh failed to execute posthook commands"
+            fi
+        fi
+    done < $HOST_FILE
+    
+    exit 0    
+}
+
+# Main =========================================================================
+
 #
 # Get options
 #
 while getopts e:qh OPTION; do
     case "$OPTION" in
-       e) environment="$OPTARG";;
+       e) ENVIRONMENT="$OPTARG";;
        q) quiet=1;;
        h) usage;;
        \?) usage;;
@@ -177,14 +297,14 @@ done
 shift $(( $OPTIND - 1 ))
 
 #
-# Check options
+# Validate options
 #
-if [ ! "${environment}" ]; then
+if [ ! "${1}" ] || [ ! "${ENVIRONMENT}" ]; then
     usage
 elif [ "${1}" == "create-dir" ]; then
-    create_dir $environment
+    create_dir $ENVIRONMENT
 elif [ ! -d $WORKING_DIR ]; then
-    trigger_error "directory missing: $(pwd)/deploy"
+    trigger_error "directory missing or invalid: ${WORKING_DIR}"
 fi
 
 #
@@ -196,113 +316,29 @@ if [ -d "${WORKING_DIR}/log" ]; then
 fi
 
 #
+# Define ENV_DIR (environment directory)
+#
+ENV_DIR=${WORKING_DIR}/env/${ENVIRONMENT}
+
+#
 # Define HOST_FILE (sync.host file)
 #
-if [ -f "${WORKING_DIR}/env/${environment}/sync.host" ]; then
-    HOST_FILE="${WORKING_DIR}/env/${environment}/sync.host"
+if [ -f "${ENV_DIR}/sync.host" ]; then
+    HOST_FILE="${ENV_DIR}/sync.host"
     echo "[${NAME_}] Using ${HOST_FILE}"
-elif [ -f "${SCRIPT_DIR}/env/${environment}/sync.host" ]; then
-    HOST_FILE="${SCRIPT_DIR}/env/${environment}/sync.host"
+elif [ -f "${SCRIPT_DIR}/env/${ENVIRONMENT}/sync.host" ]; then
+    HOST_FILE="${SCRIPT_DIR}/env/${ENVIRONMENT}/sync.host"
 else 
-    trigger_error "no such file: ${WORKING_DIR}/env/${environment}/sync.host"
+    trigger_error "no such file: ${ENV_DIR}/sync.host"
 fi
+
 if [ "${1}" == "create-ssh-key" ]; then
-    create_ssh_key $HOST_FILE
+    create_ssh_key
+elif [ "${1}" == "package" ]; then
+    package
+elif [ "${1}" == "deploy" ]; then
+    deploy
+else
+    usage
 fi
 
-#
-# Define EXCLUDE_FILE (sync.exlude file)
-#
-if [ -f "${WORKING_DIR}/env/${environment}/sync.exclude" ]; then
-    EXCLUDE_FILE="${WORKING_DIR}/env/${environment}/sync.exclude"
-    echo "[${NAME_}] Using ${EXCLUDE_FILE}"
-elif [ -f "${SCRIPT_DIR}/env/${environment}/sync.exclude" ]; then
-    EXCLUDE_FILE="${SCRIPT_DIR}/env/${environment}/sync.exclude"
-fi
-
-#
-# Define DIR_FILE (sync.dir file)
-#
-if [ -f "${WORKING_DIR}/env/${environment}/sync.dir" ]; then
-    DIR_FILE="${WORKING_DIR}/env/${environment}/sync.dir"
-    echo "[${NAME_}] Using ${DIR_FILE}"
-else 
-    trigger_error "no such file: ${ENV_DIR}/sync.dir"
-fi
-
-#
-# Define prehook and posthook commands
-#
-prehook_file="${WORKING_DIR}/env/${environment}/sync.prehook"
-if [ -f $prehook_file ]; then
-    prehook_cmds=$(sed -e :a -e '$!N;s/\n/; /;ta' $prehook_file | sed -e 's/"/'\''/g')
-fi
-posthook_file="${WORKING_DIR}/env/${environment}/sync.posthook"
-if [ -f $posthook_file ]; then
-    posthook_cmds=$(sed -e :a -e '$!N;s/\n/; /;ta' $posthook_file | sed -e 's/"/'\''/g')
-fi
-
-source $DIR_FILE
-if [ ! -d "$SOURCE_DIR" ] && [ ! -f "$SOURCE_DIR" ]; then
-    trigger_error "invalid source directory"
-elif [ ! "$TARGET_DIR" ]; then
-    trigger_error "invalid target directory"
-fi
-
-#
-# rsync options
-#
-rsync_opt="-razv --delete --force"
-if [ "${EXCLUDE_FILE}" ]; then
-    rsync_opt="${rsync_opt} --exclude-from=${EXCLUDE_FILE}"
-fi
-
-#
-# Display confirmation message
-#
-if [ ! "${quiet}" ]; then
-    echo "[${NAME_}]"
-    echo "[${NAME_}] Directory"
-    echo "[${NAME_}]     - Source: ${SOURCE_DIR}"
-    echo "[${NAME_}]     - Target: ${TARGET_DIR}"
-    echo "[${NAME_}] Exclude"
-    while read PATTERN; do
-        echo "[${NAME_}]     - ${PATTERN}"
-    done < $EXCLUDE_FILE
-    echo "[${NAME_}] Hosts"
-    while read HOST; do
-        echo "[${NAME_}]     - ${HOST}"
-    done < $HOST_FILE
-    echo "[${NAME_}]"
-    echo -n "[${NAME_}] Transfer files to remote host(s) [n/Y]? " 
-    read confirm_action
-    [[ "$confirm_action" != "Y" ]] && { echo "exit: no files were transferred"; exit 1; }
-fi
-
-#
-# Transfer files
-#
-while read HOST; do
-    echo "[${NAME_}] Copying files to ${HOST}... "
-    filename="${environment}.${RSYNC_ID}.${HOST#*@}"
-    if [ "${prehook_cmds}" ]; then
-        ssh $HOST "${prehook_cmds}"
-        if [ $? -gt 0 ]; then
-            trigger_error "ssh failed to execute prehook commands"
-        fi
-    fi
-    
-    rsync $rsync_opt $SOURCE_DIR $HOST:$TARGET_DIR | tee ${LOG_DIR}/${filename}.log
-    
-    if [ $? -gt 0 ]; then
-        trigger_error "rsync failed to copy files to ${HOST}"
-    fi
-    if [ "${posthook_cmds}" ]; then
-        ssh $HOST "${posthook_cmds}"
-        if [ $? -gt 0 ]; then
-            trigger_error "ssh failed to execute posthook commands"
-        fi
-    fi
-done < $HOST_FILE
-
-exit 0
